@@ -5,20 +5,20 @@
 #  Modified by Zhiqi Li
 # ---------------------------------------------
 
-import numpy as np
-import torch
 import copy
 import warnings
-from mmcv.cnn.bricks.registry import (ATTENTION,
-                                      TRANSFORMER_LAYER,
-                                      TRANSFORMER_LAYER_SEQUENCE)
+
+import numpy as np
+import torch
+
+from mmcv.cnn.bricks.registry import ATTENTION, TRANSFORMER_LAYER, TRANSFORMER_LAYER_SEQUENCE
 from mmcv.cnn.bricks.transformer import TransformerLayerSequence
-from mmcv.runner import force_fp32, auto_fp16
-from mmcv.utils import TORCH_VERSION, digit_version
-from mmcv.utils import ext_loader
+from mmcv.runner import auto_fp16, force_fp32
+from mmcv.utils import digit_version, TORCH_VERSION
+
 from .custom_base_transformer_layer import MyCustomBaseTransformerLayer
-ext_module = ext_loader.load_ext(
-    '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
+
+from projects.mmdet3d_plugin.bqp.ops import build_column_value_mask, densify_anchor_coords, generate_densification_offsets, gt_bbox_centers_to_bev_coords
 
 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
@@ -192,6 +192,8 @@ class BEVFormerEncoder(TransformerLayerSequence):
 
         reference_points_cam, bev_mask = self.point_sampling(
             ref_3d, self.pc_range, kwargs['img_metas'])
+        reference_points_cam = reference_points_cam.contiguous()
+        bev_mask = bev_mask.contiguous()
 
         # bug: this code should be 'shift_ref_2d = ref_2d.clone()', we keep this bug for reproducing our results in paper.
         shift_ref_2d = ref_2d.clone()
@@ -211,6 +213,116 @@ class BEVFormerEncoder(TransformerLayerSequence):
             hybird_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(
                 bs*2, len_bev, num_bev_level, 2)
 
+        key = key.permute(2, 0, 1, 3).flatten(0, 1)
+        value = value.permute(2, 0, 1, 3).flatten(0, 1)
+
+        if kwargs['runtime_options']['bqp']:
+            anchor_coords_list = list()
+            if kwargs['runtime_options']['oracle']:
+                gt_anchors = gt_bbox_centers_to_bev_coords(gt_bboxes=kwargs['gt_bboxes_3d'][0][0], gt_labels=kwargs['gt_labels_3d'][0][0], bev_h=bev_h, bev_w=bev_w)
+                gt_anchors = gt_anchors.to(bev_query.device)
+                if len(gt_anchors) != 0:
+                    anchor_coords_list.append(gt_anchors)
+
+            if kwargs['runtime_options']['tap'] and 'temporal_anchors' in kwargs['frame_cache']:
+                temporal_anchors = kwargs['frame_cache']['temporal_anchors']
+                temporal_anchors = temporal_anchors.to(bev_query.device)
+                if len(temporal_anchors) != 0:
+                    anchor_coords_list.append(temporal_anchors)
+
+            if kwargs['runtime_options']['sop'] and 'spatial_anchors' in kwargs['frame_cache']:
+                spatial_anchors = kwargs['frame_cache']['spatial_anchors']
+                spatial_anchors = spatial_anchors.to(bev_query.device)
+                if len(spatial_anchors) != 0:
+                    anchor_coords_list.append(spatial_anchors)
+
+            if len(anchor_coords_list) != 0:
+                if not hasattr(self, 'densification_offsets'):
+                    self.densification_offsets = generate_densification_offsets(densification_radius=kwargs['runtime_options']['densification_radius'], voxel_size=((self.pc_range[3] - self.pc_range[0]) / bev_w))
+                    self.densification_offsets = self.densification_offsets.to(bev_query.device)
+
+                densified_bev_coords = densify_anchor_coords(anchor_coords=torch.cat(anchor_coords_list, dim=0), densification_offsets=self.densification_offsets, bev_h=bev_h, bev_w=bev_w)
+
+                active_bev_idxs = (densified_bev_coords[:, 1] * bev_w) + densified_bev_coords[:, 0]
+                active_bev_idxs = active_bev_idxs.int().sort().values.long()
+
+                if active_bev_idxs.numel() != 0:
+                    kwargs['frame_cache'].update(active_bev_idxs=active_bev_idxs)
+                    kwargs['frame_cache'].update(query_buffer=torch.zeros_like(bev_query))
+                    kwargs['frame_cache'].update(apply_query_pruning_this_frame=True)
+
+        if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+            reference_points_cam = reference_points_cam[:, :, kwargs['frame_cache']['active_bev_idxs'], :, :]
+            bev_mask = bev_mask[:, :, kwargs['frame_cache']['active_bev_idxs'], :]
+
+            if kwargs['runtime_options']['prune_values_in_tsa']:
+                if prev_bev is None:
+                    active_bev_idxs_prev = active_bev_idxs
+                    kwargs['frame_cache'].update(active_bev_idxs_prev=active_bev_idxs_prev)
+                    kwargs['frame_cache'].update(first_frame=True)
+                else:
+                    active_bev_idxs_prev = (prev_bev[0, :, :]!=0).any(-1).nonzero()
+                    kwargs['frame_cache'].update(active_bev_idxs_prev=active_bev_idxs_prev)
+                    kwargs['frame_cache'].update(first_frame=False)
+
+                kwargs['frame_cache'].update(tsa_value_buffer=torch.zeros_like(bev_query).repeat(2, 1, 1))
+                if not kwargs['frame_cache']['first_frame']:
+                    kwargs['frame_cache'].update(tsa_valid_value0=prev_bev[0, active_bev_idxs_prev])
+                    kwargs['frame_cache'].update(tsa_valid_value1=prev_bev[1, active_bev_idxs])
+
+                kwargs['frame_cache'].update(apply_tsa_value_pruning_this_frame=True)
+
+            if kwargs['runtime_options']['prune_values_in_sca']:
+                cam_idxs, pixel_idxs = build_column_value_mask(reference_points_cam, bev_mask, spatial_shapes)
+                kwargs['frame_cache'].update(sca_valid_value=value[cam_idxs, pixel_idxs])
+                kwargs['frame_cache'].update(sca_valid_value_idxs=(cam_idxs, pixel_idxs))
+                kwargs['frame_cache'].update(sca_value_buffer=torch.zeros_like(value))
+                kwargs['frame_cache'].update(apply_sca_value_pruning_this_frame=True)
+
+        if kwargs['runtime_options']['qpa']:
+            if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+                num_query = len(kwargs['frame_cache']['active_bev_idxs'])
+            else:
+                num_query = bev_h * bev_w
+
+            visible = bev_mask.any(dim=-1)
+
+            cam_mask = torch.zeros((bs, num_query), dtype=torch.uint8, device=visible.device)
+            for cam in range(len(visible)):
+                cam_mask |= (visible[cam].to(torch.uint8) << cam)
+            kwargs['frame_cache'].update(cam_mask=cam_mask)
+
+            cnt = visible.sum(dim=0)
+            inv_cnt = torch.where(cnt > 0, 1.0 / cnt, torch.zeros_like(cnt, dtype=torch.float32))
+            kwargs['frame_cache'].update(inv_cnt=inv_cnt)
+
+        if kwargs['runtime_options']['count_num_qkv']:
+            kwargs['frame_cache'].update(num_qkv={k: 0 for k in ['tsa_q', 'sca_q', 'tsa_v', 'sca_v']})
+
+            if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+                kwargs['frame_cache']['num_qkv'].update(tsa_q=kwargs['frame_cache']['active_bev_idxs'].numel())
+            else:
+                kwargs['frame_cache']['num_qkv'].update(tsa_q=bev_h*bev_w)
+
+            if kwargs['frame_cache']['apply_tsa_value_pruning_this_frame']:
+                if 'active_bev_idxs_prev' not in kwargs['frame_cache'].keys():
+                    kwargs['frame_cache']['num_qkv'].update(tsa_v=kwargs['frame_cache']['active_bev_idxs'].numel()*2)
+                else:
+                    kwargs['frame_cache']['num_qkv'].update(tsa_v=kwargs['frame_cache']['active_bev_idxs'].numel()+kwargs['frame_cache']['active_bev_idxs_prev'].numel())
+            else:
+                kwargs['frame_cache']['num_qkv'].update(tsa_v=bev_h*bev_w*2)
+
+            if kwargs['runtime_options']['qpa']:
+                kwargs['frame_cache']['num_qkv'].update(sca_q=cnt.sum().item())
+
+            if kwargs['frame_cache']['apply_sca_value_pruning_this_frame']:
+                kwargs['frame_cache']['num_qkv'].update(sca_v=len(kwargs['frame_cache']['sca_valid_value']))
+            else:
+                kwargs['frame_cache']['num_qkv'].update(sca_v=spatial_shapes.prod(1).sum().item()*len(reference_points_cam))
+
+        if kwargs['runtime_options']['measure_latency']:
+            kwargs['frame_cache'].update(latency={k: list() for k in ['self_attn', 'cross_attn', 'ffn', 'norm']})
+
         for lid, layer in enumerate(self.layers):
             output = layer(
                 bev_query,
@@ -227,11 +339,24 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 reference_points_cam=reference_points_cam,
                 bev_mask=bev_mask,
                 prev_bev=prev_bev,
+                lid=lid,
                 **kwargs)
 
             bev_query = output
             if self.return_intermediate:
                 intermediate.append(output)
+
+        if kwargs['runtime_options']['count_num_qkv']:
+            log_row = [f"{v}" for v in kwargs['frame_cache']['num_qkv'].values()]
+            log_line = "\t".join(log_row) + "\n"
+            with open(kwargs['runtime_options']['num_qkv_log_path'], 'a') as f:
+                f.write(log_line)
+
+        if kwargs['runtime_options']['measure_latency']:
+            log_row = [f"{sum(v)/len(v)}" for v in kwargs['frame_cache']['latency'].values()]
+            log_line = "\t".join(log_row) + "\n"
+            with open(kwargs['runtime_options']['latency_log_path'], 'a') as f:
+                f.write(log_line)
 
         if self.return_intermediate:
             return torch.stack(intermediate)
@@ -303,6 +428,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                 spatial_shapes=None,
                 level_start_index=None,
                 prev_bev=None,
+                lid=None,
                 **kwargs):
         """Forward function for `TransformerDecoderLayer`.
 
@@ -353,10 +479,16 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                                                      f'to the number of attention in ' \
                 f'operation_order {self.num_attn}'
 
+        if kwargs['runtime_options']['measure_latency']:
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+
         for layer in self.operation_order:
             # temporal self attention
             if layer == 'self_attn':
-
+                if kwargs['runtime_options']['measure_latency']:
+                    torch.cuda.synchronize()
+                    s.record()
                 query = self.attentions[attn_index](
                     query,
                     prev_bev,
@@ -371,15 +503,29 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                         [[bev_h, bev_w]], device=query.device),
                     level_start_index=torch.tensor([0], device=query.device),
                     **kwargs)
+                if kwargs['runtime_options']['measure_latency']:
+                    e.record()
+                    torch.cuda.synchronize()
+                    kwargs['frame_cache']['latency'][layer].append(s.elapsed_time(e))
                 attn_index += 1
                 identity = query
 
             elif layer == 'norm':
+                if kwargs['runtime_options']['measure_latency']:
+                    torch.cuda.synchronize()
+                    s.record()
                 query = self.norms[norm_index](query)
+                if kwargs['runtime_options']['measure_latency']:
+                    e.record()
+                    torch.cuda.synchronize()
+                    kwargs['frame_cache']['latency'][layer].append(s.elapsed_time(e))
                 norm_index += 1
 
             # spaital cross attention
             elif layer == 'cross_attn':
+                if kwargs['runtime_options']['measure_latency']:
+                    torch.cuda.synchronize()
+                    s.record()
                 query = self.attentions[attn_index](
                     query,
                     key,
@@ -394,14 +540,30 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                     key_padding_mask=key_padding_mask,
                     spatial_shapes=spatial_shapes,
                     level_start_index=level_start_index,
-                    **kwargs)
+                    **kwargs
+                )
+                if kwargs['runtime_options']['measure_latency']:
+                    e.record()
+                    torch.cuda.synchronize()
+                    kwargs['frame_cache']['latency'][layer].append(s.elapsed_time(e))
                 attn_index += 1
                 identity = query
 
             elif layer == 'ffn':
+                if kwargs['runtime_options']['measure_latency']:
+                    torch.cuda.synchronize()
+                    s.record()
                 query = self.ffns[ffn_index](
                     query, identity if self.pre_norm else None)
+                if kwargs['runtime_options']['measure_latency']:
+                    e.record()
+                    torch.cuda.synchronize()
+                    kwargs['frame_cache']['latency'][layer].append(s.elapsed_time(e))
                 ffn_index += 1
+
+        if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+            kwargs['frame_cache']['query_buffer'][:, kwargs['frame_cache']['active_bev_idxs'], :] = query
+            return kwargs['frame_cache']['query_buffer']
 
         return query
 

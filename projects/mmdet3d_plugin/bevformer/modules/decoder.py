@@ -90,6 +90,11 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
         output = query
         intermediate = []
         intermediate_reference_points = []
+
+        if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+            kwargs['frame_cache'].update(valid_value=kwargs['value'][kwargs['frame_cache']['active_bev_idxs'], 0])
+            kwargs['frame_cache'].update(value_buffer=torch.zeros_like(kwargs['value']))
+
         for lid, layer in enumerate(self.layers):
 
             reference_points_input = reference_points[..., :2].unsqueeze(
@@ -292,7 +297,12 @@ class CustomMSDeformableAttention(BaseModule):
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
-        value = self.value_proj(value)
+        if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+            bev_idxs = kwargs['frame_cache']['active_bev_idxs']
+            kwargs['frame_cache']['value_buffer'][bev_idxs, 0] = self.value_proj(kwargs['frame_cache']['valid_value'])
+            value = kwargs['frame_cache']['value_buffer']
+        else:
+            value = self.value_proj(value)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)

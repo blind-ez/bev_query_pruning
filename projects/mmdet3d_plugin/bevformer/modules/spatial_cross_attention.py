@@ -23,6 +23,7 @@ from mmcv.runner.base_module import BaseModule, ModuleList, Sequential
 from mmcv.utils import ext_loader
 from .multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32, \
     MultiScaleDeformableAttnFunction_fp16
+from projects.mmdet3d_plugin.bqp.qpa_ext_src.qpa_ext import qpa_cuda_forward
 from projects.mmdet3d_plugin.models.utils.bricks import run_time
 ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
@@ -120,59 +121,105 @@ class SpatialCrossAttention(BaseModule):
              Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
 
-        if key is None:
-            key = query
-        if value is None:
-            value = key
+        if kwargs['runtime_options']['qpa']:
+            if residual is None:
+                inp_residual = query
+            if query_pos is not None:
+                query = query + query_pos
 
-        if residual is None:
-            inp_residual = query
-            slots = torch.zeros_like(query)
-        if query_pos is not None:
-            query = query + query_pos
+            bs, num_query, _ = query.shape
+            num_cams, num_values, _, = value.shape
+            num_levels, _ = spatial_shapes.shape
+            num_heads = self.deformable_attention.num_heads
+            _, _, _, num_anchors, _ = reference_points_cam.shape
 
-        bs, num_query, _ = query.size()
+            cam_mask = kwargs['frame_cache']['cam_mask']
+            inv_cnt = kwargs['frame_cache']['inv_cnt']
 
-        D = reference_points_cam.size(3)
-        indexes = []
-        for i, mask_per_img in enumerate(bev_mask):
-            index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
-            indexes.append(index_query_per_img)
-        max_len = max([len(each) for each in indexes])
+            sampling_offsets = self.deformable_attention.sampling_offsets(query).view(bs, num_query, num_heads, num_levels, -1, num_anchors, 2)
+            offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            sampling_offsets = sampling_offsets / offset_normalizer[None, None, None, :, None, None, :]
+            sampling_locations = reference_points_cam.transpose(0, 1)[:, :, :, None, None, None, :, :] + sampling_offsets[:, None, :, :, :, :, :, :]
+            sampling_locations = sampling_locations.view(bs, num_cams, num_query, num_heads, num_levels, -1, 2)
 
-        # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.
-        queries_rebatch = query.new_zeros(
-            [bs, self.num_cams, max_len, self.embed_dims])
-        reference_points_rebatch = reference_points_cam.new_zeros(
-            [bs, self.num_cams, max_len, D, 2])
-        
-        for j in range(bs):
-            for i, reference_points_per_img in enumerate(reference_points_cam):   
-                index_query_per_img = indexes[i]
-                queries_rebatch[j, i, :len(index_query_per_img)] = query[j, index_query_per_img]
-                reference_points_rebatch[j, i, :len(index_query_per_img)] = reference_points_per_img[j, index_query_per_img]
+            attention_weights = self.deformable_attention.attention_weights(query).view(bs, num_query, num_heads, -1)
+            attention_weights = attention_weights.softmax(-1)
+            attention_weights = attention_weights.view(bs, num_query, num_heads, num_levels, -1)
 
-        num_cams, l, bs, embed_dims = key.shape
+            if kwargs['frame_cache']['apply_sca_value_pruning_this_frame']:
+                cam_idxs, pixel_idxs = kwargs['frame_cache']['sca_valid_value_idxs']
+                kwargs['frame_cache']['sca_value_buffer'][cam_idxs, pixel_idxs] = self.deformable_attention.value_proj(kwargs['frame_cache']['sca_valid_value'])
+                value = kwargs['frame_cache']['sca_value_buffer']
+            else:
+                value = self.deformable_attention.value_proj(value)
+            value = value.reshape(*value.shape[:-1], num_heads, -1).unsqueeze(0)
 
-        key = key.permute(2, 0, 1, 3).reshape(
-            bs * self.num_cams, l, self.embed_dims)
-        value = value.permute(2, 0, 1, 3).reshape(
-            bs * self.num_cams, l, self.embed_dims)
+            output = qpa_cuda_forward(
+                value,
+                spatial_shapes,
+                level_start_index,
+                sampling_locations,
+                attention_weights,
+                cam_mask,
+                inv_cnt,
+                self.deformable_attention.im2col_step
+            )
 
-        queries = self.deformable_attention(query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims), key=key, value=value,
-                                            reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
-                                            level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
-        for j in range(bs):
-            for i, index_query_per_img in enumerate(indexes):
-                slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]
+            output = self.output_proj(output)
 
-        count = bev_mask.sum(-1) > 0
-        count = count.permute(1, 2, 0).sum(-1)
-        count = torch.clamp(count, min=1.0)
-        slots = slots / count[..., None]
-        slots = self.output_proj(slots)
+            return self.dropout(output) + inp_residual
 
-        return self.dropout(slots) + inp_residual
+        else:
+            if key is None:
+                key = query
+            if value is None:
+                value = key
+
+            if residual is None:
+                inp_residual = query
+                slots = torch.zeros_like(query)
+            if query_pos is not None:
+                query = query + query_pos
+
+            bs, num_query, _ = query.size()
+
+            D = reference_points_cam.size(3)
+            indexes = []
+            for i, mask_per_img in enumerate(bev_mask):
+                index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
+                indexes.append(index_query_per_img)
+            max_len = max([len(each) for each in indexes])
+            if kwargs['runtime_options']['count_num_qkv']:
+                kwargs['frame_cache']['num_qkv'].update(sca_q=max_len*self.num_cams)
+
+            # each camera only interacts with its coresponding BEV queries. This step can  greatly save GPU memory.
+            queries_rebatch = query.new_zeros(
+                [bs, self.num_cams, max_len, self.embed_dims])
+            reference_points_rebatch = reference_points_cam.new_zeros(
+                [bs, self.num_cams, max_len, D, 2])
+
+            for j in range(bs):
+                for i, reference_points_per_img in enumerate(reference_points_cam):   
+                    index_query_per_img = indexes[i]
+                    queries_rebatch[j, i, :len(index_query_per_img)] = query[j, index_query_per_img]
+                    reference_points_rebatch[j, i, :len(index_query_per_img)] = reference_points_per_img[j, index_query_per_img]
+
+            queries = self.deformable_attention(query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims), key=key, value=value,
+                                                reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
+                                                level_start_index=level_start_index, **kwargs).view(bs, self.num_cams, max_len, self.embed_dims)
+
+            for j in range(bs):
+                for i, index_query_per_img in enumerate(indexes):
+                    slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]
+
+            count = bev_mask.sum(-1) > 0
+            count = count.permute(1, 2, 0).sum(-1)
+            count = torch.clamp(count, min=1.0)
+            slots = slots / count[..., None]
+
+            slots = self.output_proj(slots)
+
+            return self.dropout(slots) + inp_residual
 
 
 @ATTENTION.register_module()
@@ -331,12 +378,14 @@ class MSDeformableAttention3D(BaseModule):
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
-        value = self.value_proj(value)
-        if key_padding_mask is not None:
-            value = value.masked_fill(key_padding_mask[..., None], 0.0)
-        value = value.view(bs, num_value, self.num_heads, -1)
-        sampling_offsets = self.sampling_offsets(query).view(
-            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+        if kwargs['frame_cache']['apply_sca_value_pruning_this_frame']:        
+            cam_idxs, pixel_idxs = kwargs['frame_cache']['sca_valid_value_idxs']
+            kwargs['frame_cache']['sca_value_buffer'][cam_idxs, pixel_idxs] = self.value_proj(kwargs['frame_cache']['sca_valid_value'])
+            value = kwargs['frame_cache']['sca_value_buffer']
+        else:
+            value = self.value_proj(value)
+        value = value.reshape(*value.shape[:-1], self.num_heads, -1)
+
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
 
@@ -346,6 +395,10 @@ class MSDeformableAttention3D(BaseModule):
                                                    self.num_heads,
                                                    self.num_levels,
                                                    self.num_points)
+
+        sampling_offsets = self.sampling_offsets(query).view(
+            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+
 
         if reference_points.shape[-1] == 2:
             """

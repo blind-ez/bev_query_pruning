@@ -4,17 +4,21 @@
 #  Modified by Zhiqi Li
 # ---------------------------------------------
 
+import copy
+
+import numpy as np
 import torch
-from mmcv.runner import force_fp32, auto_fp16
+
+from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
+from mmdet3d.models import builder
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
+from torch.cuda.amp import autocast
+
+from projects.mmdet3d_plugin.bqp.ops import get_ego_motion, lidar_coords_to_bev_coords, propagate_previous_detections
+from projects.mmdet3d_plugin.bqp.utils import denormalize_bbox
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
-import time
-import copy
-import numpy as np
-import mmdet3d
-from projects.mmdet3d_plugin.models.utils.bricks import run_time
 
 
 @DETECTORS.register_module()
@@ -33,6 +37,7 @@ class BEVFormer(MVXTwoStageDetector):
                  img_backbone=None,
                  pts_backbone=None,
                  img_neck=None,
+                 sop_head=None,
                  pts_neck=None,
                  pts_bbox_head=None,
                  img_roi_head=None,
@@ -40,7 +45,9 @@ class BEVFormer(MVXTwoStageDetector):
                  train_cfg=None,
                  test_cfg=None,
                  pretrained=None,
-                 video_test_mode=False
+                 video_test_mode=False,
+                 bev_size=None,
+                 runtime_options=None
                  ):
 
         super(BEVFormer,
@@ -63,6 +70,10 @@ class BEVFormer(MVXTwoStageDetector):
             'prev_angle': 0,
         }
 
+        self.bev_h, self.bev_w = bev_size
+        self.runtime_options = runtime_options
+
+        self.sop_head = builder.build_head(sop_head) if sop_head is not None else None
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
         """Extract features of images."""
@@ -242,7 +253,10 @@ class BEVFormer(MVXTwoStageDetector):
 
         if img_metas[0][0]['scene_token'] != self.prev_frame_info['scene_token']:
             # the first sample of each scene is truncated
+            self.sample_idx = 0
             self.prev_frame_info['prev_bev'] = None
+        else:
+            self.sample_idx += 1
         # update idx
         self.prev_frame_info['scene_token'] = img_metas[0][0]['scene_token']
 
@@ -260,33 +274,83 @@ class BEVFormer(MVXTwoStageDetector):
             img_metas[0][0]['can_bus'][-1] = 0
             img_metas[0][0]['can_bus'][:3] = 0
 
-        new_prev_bev, bbox_results = self.simple_test(
+        kwargs.update(runtime_options=self.runtime_options)
+        kwargs.update(frame_cache=dict())
+
+        kwargs['frame_cache'].update(apply_query_pruning_this_frame=False)
+        kwargs['frame_cache'].update(apply_tsa_value_pruning_this_frame=False)
+        kwargs['frame_cache'].update(apply_sca_value_pruning_this_frame=False)
+
+        if self.runtime_options['bqp'] and self.runtime_options['tap']:
+            if self.sample_idx != 0 and len(self.prev_frame_info['prev_bbox_preds']) != 0:
+                ego_delta_yaw, ego_shift = get_ego_motion(img_metas[0][0])
+                propagated_centers = propagate_previous_detections(
+                    prev_preds=self.prev_frame_info['prev_bbox_preds'],
+                    ego_delta_yaw=ego_delta_yaw,
+                    ego_shift=ego_shift
+                )
+                temporal_anchors = lidar_coords_to_bev_coords(lidar_coords=propagated_centers, bev_h=self.bev_h, bev_w=self.bev_w)
+                kwargs['frame_cache'].update(temporal_anchors=temporal_anchors)
+
+        outs, bbox_results = self.simple_test(
             img_metas[0], img[0], prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
+
+        if self.runtime_options['bqp'] and self.runtime_options['tap']:
+            cls_scores = outs['all_cls_scores'][-1, 0]
+            bbox_preds = outs['all_bbox_preds'][-1, 0]
+
+            preds_mask = cls_scores.max(1).values.sigmoid() > self.runtime_options['tap_threshold']
+            bbox_preds = bbox_preds[preds_mask]
+
+            if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+                bbox_bev_coords = lidar_coords_to_bev_coords(bbox_preds[:, :2], self.bev_h, self.bev_w)
+                bbox_bev_idxs = (bbox_bev_coords[:, 1] * self.bev_w) + bbox_bev_coords[:, 0]
+
+                preds_mask = (bbox_bev_idxs[:, None] == kwargs['frame_cache']['active_bev_idxs'][None, :]).any(-1)
+
+                bbox_preds = bbox_preds[preds_mask]
+
+            bbox_preds = denormalize_bbox(bbox_preds)
+            bbox_preds[:, 2] = bbox_preds[:, 2] - bbox_preds[:, 5] * 0.5
+
+            self.prev_frame_info['prev_bbox_preds'] = bbox_preds
+
         # During inference, we save the BEV features and ego motion of each timestamp.
         self.prev_frame_info['prev_pos'] = tmp_pos
         self.prev_frame_info['prev_angle'] = tmp_angle
-        self.prev_frame_info['prev_bev'] = new_prev_bev
+        self.prev_frame_info['prev_bev'] = outs['bev_embed']
         return bbox_results
 
-    def simple_test_pts(self, x, img_metas, prev_bev=None, rescale=False):
+    def simple_test_pts(self, x, img_metas, prev_bev=None, rescale=False, **kwargs):
         """Test function"""
-        outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev)
+        outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev, **kwargs)
 
         bbox_list = self.pts_bbox_head.get_bboxes(
-            outs, img_metas, rescale=rescale)
+            outs, img_metas, rescale=rescale, **kwargs)
         bbox_results = [
             bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list
         ]
-        return outs['bev_embed'], bbox_results
+        return outs, bbox_results
 
-    def simple_test(self, img_metas, img=None, prev_bev=None, rescale=False):
+    def simple_test(self, img_metas, img=None, prev_bev=None, rescale=False, **kwargs):
         """Test function without augmentaiton."""
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        if self.runtime_options['run_backbone_fp16']:
+            with autocast():
+                img_feats = self.extract_feat(img=img, img_metas=img_metas)
+            for i, feat in enumerate(img_feats):
+                img_feats[i] = feat.float()
+        else:
+            img_feats = self.extract_feat(img=img, img_metas=img_metas)
+
+        if self.runtime_options['bqp'] and self.runtime_options['sop']:
+            spatial_anchors = self.sop_head.forward_test(img_feats, img_metas, self.runtime_options['sop_threshold'])
+            if spatial_anchors is not None:
+                kwargs['frame_cache'].update(spatial_anchors=spatial_anchors)
 
         bbox_list = [dict() for i in range(len(img_metas))]
-        new_prev_bev, bbox_pts = self.simple_test_pts(
-            img_feats, img_metas, prev_bev, rescale=rescale)
+        outs, bbox_pts = self.simple_test_pts(
+            img_feats, img_metas, prev_bev, rescale=rescale, **kwargs)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
-        return new_prev_bev, bbox_list
+        return outs, bbox_list

@@ -181,6 +181,10 @@ class TemporalSelfAttention(BaseModule):
 
             # value = torch.cat([query, query], 0)
 
+        if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+            query = query[:, kwargs['frame_cache']['active_bev_idxs'], :]
+            query_pos = query_pos[:, kwargs['frame_cache']['active_bev_idxs'], :]
+
         if identity is None:
             identity = query
         if query_pos is not None:
@@ -194,14 +198,22 @@ class TemporalSelfAttention(BaseModule):
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
         assert self.num_bev_queue == 2
 
-        query = torch.cat([value[:bs], query], -1)
-        value = self.value_proj(value)
+        if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+            query = torch.cat([value[:bs][:, kwargs['frame_cache']['active_bev_idxs']], query], -1)
+        else:
+            query = torch.cat([value[:bs], query], -1)
 
-        if key_padding_mask is not None:
-            value = value.masked_fill(key_padding_mask[..., None], 0.0)
-
-        value = value.reshape(bs*self.num_bev_queue,
-                              num_value, self.num_heads, -1)
+        if kwargs['frame_cache']['apply_tsa_value_pruning_this_frame']:
+            if kwargs['frame_cache']['first_frame']:
+                kwargs['frame_cache']['tsa_value_buffer'][:, kwargs['frame_cache']['active_bev_idxs']] = self.value_proj(value[:, kwargs['frame_cache']['active_bev_idxs']])
+                value = kwargs['frame_cache']['tsa_value_buffer']
+            else:
+                kwargs['frame_cache']['tsa_value_buffer'][0, kwargs['frame_cache']['active_bev_idxs_prev']] = self.value_proj(kwargs['frame_cache']['tsa_valid_value0'])
+                kwargs['frame_cache']['tsa_value_buffer'][1, kwargs['frame_cache']['active_bev_idxs']] = self.value_proj(kwargs['frame_cache']['tsa_valid_value1'])                    
+                value = kwargs['frame_cache']['tsa_value_buffer']
+        else:
+            value = self.value_proj(value)
+        value = value.reshape(*value.shape[:-1], self.num_heads, -1)
 
         sampling_offsets = self.sampling_offsets(query)
         sampling_offsets = sampling_offsets.view(
@@ -224,9 +236,14 @@ class TemporalSelfAttention(BaseModule):
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
-            sampling_locations = reference_points[:, :, None, :, None, :] \
-                + sampling_offsets \
-                / offset_normalizer[None, None, None, :, None, :]
+            if kwargs['frame_cache']['apply_query_pruning_this_frame']:
+                sampling_locations = reference_points[:, kwargs['frame_cache']['active_bev_idxs'], :, :][:, :, None, :, None, :] \
+                    + sampling_offsets \
+                    / offset_normalizer[None, None, None, :, None, :]
+            else:
+                sampling_locations = reference_points[:, :, None, :, None, :] \
+                    + sampling_offsets \
+                    / offset_normalizer[None, None, None, :, None, :]
 
         elif reference_points.shape[-1] == 4:
             sampling_locations = reference_points[:, :, None, :, None, :2] \
